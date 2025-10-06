@@ -1,46 +1,9 @@
-# app.py — Unified server (IP registry + image edit + banner)
+# app.py — Unified server (IP registry + image edit + banner + logo)
 # -----------------------------------------------------------
-# Requirements:
-#   pip install -r requirements.txt
-#
-# Environment (optional but recommended):
-#   HF_TOKEN=hf_...               # for Hugging Face Space
-#   PORT=5001                     # Render/Heroku will inject PORT automatically
-#   HOST=0.0.0.0
-#   DEBUG=1
-#   BANNER_PATH=/absolute/path/to/aljazari_banner.png
-#
-# Run:
-#   python app.py
-#
-# Test examples:
-#   # Register Pi IP:
-#   curl -X POST http://localhost:5001/register_pi_ip  \
-#     -H "Content-Type: application/json" \
-#     -d "{\"ip\":\"192.168.68.200\",\"time\":\"2025-10-01T09:00:00\"}"
-#
-#   # Get Pi IP:
-#   curl http://localhost:5001/get_pi_ip
-#
-#   # Register Cruzr IP:
-#   curl -X POST http://localhost:5001/register_cruzr_ip \
-#     -H "Content-Type: application/json" \
-#     -d "{\"ip\":\"192.168.68.110\",\"time\":\"2025-10-01T09:05:00\"}"
-#
-#   # Add banner to any image (using repo banner):
-#   curl -X POST http://localhost:$PORT/add_banner \
-#     -F "image=@/path/to/photo.jpg" -o with_banner.png
-#
-#   # Add banner to any image (uploading banner per request):
-#   curl -X POST http://localhost:$PORT/add_banner \
-#     -F "image=@/path/to/photo.jpg" \
-#     -F "banner=@/path/to/aljazari_banner.png" -o with_banner.png
-#
-#   # Ride (Space call) with uploaded person + uploaded banner:
-#   curl -X POST http://localhost:$PORT/ride \
-#     -F "person=@/path/to/person.jpg" \
-#     -F "with_banner=1" \
-#     -F "banner=@/path/to/aljazari_banner.png" -o ride_output.png
+# New:
+#   - attach_logo() utility
+#   - /add_logo endpoint
+#   - /ride supports with_logo=1 and optional 'logo' upload
 # -----------------------------------------------------------
 
 import io
@@ -50,7 +13,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 # ---------------- IP REGISTRY STATE ----------------
 latest_pi_ip = None
@@ -64,9 +27,11 @@ SPACE_ID = "akhaliq/Qwen-Image-Edit-2509"
 # App directory + default assets path (portable across Linux/Windows)
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_BANNER = APP_DIR / "assets" / "aljazari_banner.png"
+DEFAULT_LOGO = APP_DIR / "assets" / "logo.png"  # <—— NEW default logo path
 
-# You can override via env: BANNER_PATH=/abs/path/to/aljazari_banner.png
+# You can override via env
 BANNER_PATH = Path(os.getenv("BANNER_PATH", str(DEFAULT_BANNER)))
+LOGO_PATH = Path(os.getenv("LOGO_PATH", str(DEFAULT_LOGO)))  # <—— NEW
 
 DEFAULT_PROMPT = (
     " a person riding the dragon, seated astride, hands holding a horn or spine, "
@@ -104,7 +69,6 @@ def _init_gradio():
         from gradio_client.exceptions import AppError
         _AppError = AppError
         _handle_file = handle_file
-        # Init client
         _client = Client(SPACE_ID, hf_token=HF_TOKEN)
         _gradio_ready = True
     except Exception:
@@ -118,10 +82,6 @@ def attach_banner(base_img: Image.Image,
                   align: str = "center") -> Image.Image:
     """
     Append banner_img BELOW base_img.
-    - If banner_height_px is provided, use it.
-    - Else compute height = base_img.height * banner_ratio (default 18%).
-    - Banner is resized to base width (keeping aspect); then cropped or padded to target height.
-    - align: 'center' | 'left' | 'right' (horizontal placement if needed in the future).
     """
     base = base_img.convert("RGBA")
     banner = banner_img.convert("RGBA")
@@ -156,10 +116,73 @@ def attach_banner(base_img: Image.Image,
     out.paste(banner_final, (0, base.height), banner_final)
     return out.convert("RGB")
 
+# ---------------- UTIL: LOGO ATTACH (NEW) ----------------
+def _apply_opacity(img_rgba: Image.Image, opacity: float) -> Image.Image:
+    """Return a copy of img with alpha multiplied by opacity (0..1)."""
+    if img_rgba.mode != "RGBA":
+        img_rgba = img_rgba.convert("RGBA")
+    r, g, b, a = img_rgba.split()
+    a = ImageEnhance.Brightness(a).enhance(max(0.0, min(1.0, opacity)))
+    return Image.merge("RGBA", (r, g, b, a))
+
+def attach_logo(base_img: Image.Image,
+                logo_img: Image.Image,
+                logo_width_ratio: float = 0.18,
+                position: str = "bottom-right",
+                margin_px: int = 24,
+                opacity: float = 1.0) -> Image.Image:
+    """
+    Overlay logo_img on top of base_img.
+
+    Args:
+      logo_width_ratio: logo width relative to base width (e.g., 0.18 = 18% of width).
+      position: 'top-left'|'top-right'|'bottom-left'|'bottom-right'|'center'
+      margin_px: padding from the edges (ignored for center).
+      opacity: 0..1 transparency.
+
+    Returns:
+      New RGB image with logo placed.
+    """
+    base = base_img.convert("RGBA")
+    logo = logo_img.convert("RGBA")
+
+    # Scale logo width to ratio of base width, keep aspect
+    target_w = max(1, int(base.width * max(0.0, min(1.0, logo_width_ratio))))
+    scale = target_w / logo.width
+    target_h = max(1, int(logo.height * scale))
+    logo_resized = logo.resize((target_w, target_h), Image.LANCZOS)
+
+    if opacity < 1.0:
+        logo_resized = _apply_opacity(logo_resized, opacity)
+
+    # Compute paste position
+    if position not in {"top-left", "top-right", "bottom-left", "bottom-right", "center"}:
+        position = "bottom-right"
+
+    if position == "center":
+        x = (base.width - logo_resized.width) // 2
+        y = (base.height - logo_resized.height) // 2
+    elif position == "top-left":
+        x = margin_px
+        y = margin_px
+    elif position == "top-right":
+        x = base.width - logo_resized.width - margin_px
+        y = margin_px
+    elif position == "bottom-left":
+        x = margin_px
+        y = base.height - logo_resized.height - margin_px
+    else:  # bottom-right
+        x = base.width - logo_resized.width - margin_px
+        y = base.height - logo_resized.height - margin_px
+
+    out = base.copy()
+    out.paste(logo_resized, (x, y), logo_resized)
+    return out.convert("RGB")
+
 # ---------------- BASIC PAGES ----------------
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"ok": True, "service": "ip+banner+ride"})
+    return jsonify({"ok": True, "service": "ip+banner+logo+ride"})
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -208,9 +231,15 @@ def ride():
       - guidance (float) [optional]
       - seed (int)     [optional]
       - with_banner (0/1) [optional]
-      - banner (file)  [optional]  <- upload banner per request
+      - banner (file)  [optional]
       - banner_height_px (int) [optional]
-      - banner_ratio (float)   [optional; ignored if height given]
+      - banner_ratio (float)   [optional]
+      - with_logo (0/1)        [optional]  <—— NEW
+      - logo (file)            [optional]  <—— NEW
+      - logo_width_ratio (float) [optional; default 0.18]
+      - logo_position (str)      [optional; default 'bottom-right']
+      - logo_margin_px (int)     [optional; default 24]
+      - logo_opacity (float)     [optional; default 1.0]
     returns: image/png
     """
     if "person" not in request.files:
@@ -243,8 +272,23 @@ def ride():
     banner_ratio = request.form.get("banner_ratio")
     banner_ratio = float(banner_ratio) if banner_ratio else 0.18
 
-    # You must set DRAGON_PATH to a valid file (we ship it via env or keep alongside the server)
-    # To avoid cross-OS confusion, let users set DRAGON_PATH via env. If not set, fail gracefully.
+    # NEW logo params
+    with_logo = request.form.get("with_logo", "0") in ("1", "true", "True")
+    try:
+        logo_width_ratio = float(request.form.get("logo_width_ratio", 0.18))
+    except ValueError:
+        return jsonify({"error": "bad_params", "detail": "logo_width_ratio must be float"}), 400
+    logo_position = request.form.get("logo_position", "bottom-right")
+    try:
+        logo_margin_px = int(request.form.get("logo_margin_px", 24))
+    except ValueError:
+        return jsonify({"error": "bad_params", "detail": "logo_margin_px must be int"}), 400
+    try:
+        logo_opacity = float(request.form.get("logo_opacity", 1.0))
+    except ValueError:
+        return jsonify({"error": "bad_params", "detail": "logo_opacity must be float"}), 400
+
+    # DRAGON IMAGE must exist
     DRAGON_PATH = os.getenv("DRAGON_PATH")
     if not DRAGON_PATH or not os.path.exists(DRAGON_PATH):
         return jsonify({
@@ -269,7 +313,7 @@ def ride():
         # open result
         img = Image.open(result_path).convert("RGB")
 
-        # optional banner (from upload or from disk)
+        # optional banner
         if with_banner:
             banner_file = request.files.get("banner")
             if banner_file:
@@ -279,6 +323,25 @@ def ride():
                     return jsonify({"error": "banner_not_found", "detail": str(BANNER_PATH)}), 500
                 banner_img = Image.open(BANNER_PATH)
             img = attach_banner(img, banner_img, banner_height_px=banner_height_px, banner_ratio=banner_ratio)
+
+        # optional logo (after banner so logo stays inside the main canvas)
+        if with_logo:
+            logo_file = request.files.get("logo")
+            if logo_file:
+                logo_img = Image.open(logo_file.stream)
+            else:
+                if not LOGO_PATH.exists():
+                    return jsonify({"error": "logo_not_found", "detail": str(LOGO_PATH)}), 500
+                logo_img = Image.open(LOGO_PATH)
+
+            img = attach_logo(
+                img,
+                logo_img,
+                logo_width_ratio=logo_width_ratio,
+                position=logo_position,
+                margin_px=logo_margin_px,
+                opacity=logo_opacity,
+            )
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -305,9 +368,9 @@ def add_banner_endpoint():
     Append the banner below any uploaded image.
     multipart/form-data:
       - image (file)           [required]
-      - banner (file)          [optional]  <- upload banner per request
+      - banner (file)          [optional]
       - banner_height_px (int) [optional]
-      - banner_ratio (float)   [optional] default 0.18
+      - banner_ratio (float)   [optional]
     returns: image/png
     """
     if "image" not in request.files:
@@ -331,7 +394,6 @@ def add_banner_endpoint():
 
     base_img = Image.open(image_file.stream).convert("RGB")
 
-    # Use uploaded banner if provided; otherwise fallback to disk path
     banner_file = request.files.get("banner")
     if banner_file:
         banner_img = Image.open(banner_file.stream)
@@ -346,6 +408,68 @@ def add_banner_endpoint():
     buf.seek(0)
     return send_file(buf, mimetype="image/png", download_name="with_banner.png")
 
+# ---------------- IMAGE: ADD LOGO (NEW) ----------------
+@app.route("/add_logo", methods=["POST"])
+def add_logo_endpoint():
+    """
+    Overlay a logo onto the uploaded image.
+    multipart/form-data:
+      - image (file)            [required]
+      - logo (file)             [optional]  (fallback to LOGO_PATH)
+      - logo_width_ratio (float) [optional] default 0.18
+      - logo_position (str)      [optional] default 'bottom-right'
+      - logo_margin_px (int)     [optional] default 24
+      - logo_opacity (float)     [optional] default 1.0
+    returns: image/png
+    """
+    if "image" not in request.files:
+        return jsonify({"error": "missing file field 'image'"}), 400
+
+    image_file = request.files["image"]
+    if not image_file.filename:
+        return jsonify({"error": "empty filename"}), 400
+
+    try:
+        logo_width_ratio = float(request.form.get("logo_width_ratio", 0.18))
+    except ValueError:
+        return jsonify({"error": "bad_params", "detail": "logo_width_ratio must be float"}), 400
+
+    logo_position = request.form.get("logo_position", "bottom-right")
+
+    try:
+        logo_margin_px = int(request.form.get("logo_margin_px", 24))
+    except ValueError:
+        return jsonify({"error": "bad_params", "detail": "logo_margin_px must be int"}), 400
+
+    try:
+        logo_opacity = float(request.form.get("logo_opacity", 1.0))
+    except ValueError:
+        return jsonify({"error": "bad_params", "detail": "logo_opacity must be float"}), 400
+
+    base_img = Image.open(image_file.stream).convert("RGB")
+
+    # Use uploaded logo if provided; otherwise fallback to disk path
+    logo_file = request.files.get("logo")
+    if logo_file:
+        logo_img = Image.open(logo_file.stream)
+    else:
+        if not LOGO_PATH.exists():
+            return jsonify({"error": "logo_not_found", "detail": str(LOGO_PATH)}), 500
+        logo_img = Image.open(LOGO_PATH)
+
+    out = attach_logo(
+        base_img,
+        logo_img,
+        logo_width_ratio=logo_width_ratio,
+        position=logo_position,
+        margin_px=logo_margin_px,
+        opacity=logo_opacity,
+    )
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png", download_name="with_logo.png")
+
 # ---------------- DEBUG HELPERS ----------------
 @app.route("/debug/env", methods=["GET"])
 def debug_env():
@@ -357,6 +481,8 @@ def debug_env():
         "SPACE_ID": SPACE_ID,
         "BANNER_PATH": str(BANNER_PATH),
         "BANNER_EXISTS": BANNER_PATH.exists(),
+        "LOGO_PATH": str(LOGO_PATH),                 # <—— NEW
+        "LOGO_EXISTS": LOGO_PATH.exists(),           # <—— NEW
         "DRAGON_PATH": os.getenv("DRAGON_PATH"),
         "DRAGON_EXISTS": os.path.exists(os.getenv("DRAGON_PATH", "")) if os.getenv("DRAGON_PATH") else False,
         "HF_TOKEN_SET": bool(HF_TOKEN),
