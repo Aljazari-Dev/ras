@@ -257,14 +257,22 @@ def add_banner_endpoint():
         if before_img.size != after_img.size:
             before_img = before_img.resize(after_img.size, Image.LANCZOS)
             
-        # Create a new canvas twice as wide
-        combined_width = before_img.width + after_img.width
-        combined_height = after_img.height
+        # To prevent the final image from being too wide, crop the center 50% of both images
+        w, h = after_img.size
+        left_crop = int(w * 0.25)
+        right_crop = int(w * 0.75)
+        
+        before_cropped = before_img.crop((left_crop, 0, right_crop, h))
+        after_cropped = after_img.crop((left_crop, 0, right_crop, h))
+            
+        # Create a new canvas with the ORIGINAL width
+        combined_width = before_cropped.width + after_cropped.width
+        combined_height = h
         combined_img = Image.new("RGB", (combined_width, combined_height))
         
         # Paste Before on the left, After on the right
-        combined_img.paste(before_img, (0, 0))
-        combined_img.paste(after_img, (before_img.width, 0))
+        combined_img.paste(before_cropped, (0, 0))
+        combined_img.paste(after_cropped, (before_cropped.width, 0))
 
         # Use uploaded banner if provided; otherwise fallback to disk path
         banner_file = request.files.get("banner")
