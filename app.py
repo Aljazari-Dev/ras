@@ -76,7 +76,7 @@ DEFAULT_BANNER = APP_DIR / "assets" / "1.png"
 # You can override via env: BANNER_PATH=/abs/path/to/1.png
 BANNER_PATH = Path(os.getenv("BANNER_PATH", str(DEFAULT_BANNER)))
 
-DEFAULT_PROMPT = "Perform a highly realistic digital facelift and beauty enhancement. Smooth the skin, remove blemishes and wrinkles, and enhance facial symmetry and youthfulness while perfectly preserving the person's core identity, facial structure, and realism. High quality, professional photography."
+DEFAULT_PROMPT = "Perform a subtle medical facelift only. Remove wrinkles and slightly tighten the skin to make the person look naturally younger. Do NOT add any makeup, lipstick, or cosmetics. Preserve the natural skin texture, lighting, and the exact identity of the person."
 
 # ---------------- APP INIT ----------------
 load_dotenv()
@@ -250,7 +250,21 @@ def add_banner_endpoint():
         if result_img is None:
             return jsonify({"error": "generation_failed", "detail": "No image returned by Gemini"}), 500
 
-        base_img = result_img.convert("RGB")
+        after_img = result_img.convert("RGB")
+        before_img = original_img.convert("RGB")
+        
+        # Ensure both images are exactly the same size
+        if before_img.size != after_img.size:
+            before_img = before_img.resize(after_img.size, Image.LANCZOS)
+            
+        # Create a new canvas twice as wide
+        combined_width = before_img.width + after_img.width
+        combined_height = after_img.height
+        combined_img = Image.new("RGB", (combined_width, combined_height))
+        
+        # Paste Before on the left, After on the right
+        combined_img.paste(before_img, (0, 0))
+        combined_img.paste(after_img, (before_img.width, 0))
 
         # Use uploaded banner if provided; otherwise fallback to disk path
         banner_file = request.files.get("banner")
@@ -261,7 +275,7 @@ def add_banner_endpoint():
                 return jsonify({"error": "banner_not_found", "detail": str(BANNER_PATH)}), 500
             banner_img = Image.open(BANNER_PATH)
 
-        out = attach_banner(base_img, banner_img, banner_height_px=banner_height_px, banner_ratio=banner_ratio)
+        out = attach_banner(combined_img, banner_img, banner_height_px=banner_height_px, banner_ratio=banner_ratio)
         buf = io.BytesIO()
         out.save(buf, format="PNG")
         buf.seek(0)
